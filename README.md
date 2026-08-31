@@ -1,4 +1,3 @@
-````markdown
 # xdna.cpp
 
 AMD put a whole NPU in Phoenix and Hawk Point laptops, so I wanted to see if we could actually use the thing for local LLM inference.
@@ -284,4 +283,3 @@ If you have a Phoenix or Hawk Point machine and manage to run this on it, result
 MIT.
 
 See `THIRD_PARTY_NOTICES.md` for the upstream llama.cpp and AMD acknowledgements.
-````
