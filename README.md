@@ -1,93 +1,221 @@
+````markdown
 # xdna.cpp
 
-Using AMD's hawkpoint NPUs to run LLMs! It's a llama.cpp plugin (not a standalone runtime) to keep full model compatibility, with custom Q4_0 dequant/GEMV kernels written for the XDNA1 / AIE2 architecture.
+AMD put a whole NPU in Phoenix and Hawk Point laptops, so I wanted to see if we could actually use the thing for local LLM inference.
 
----
+`xdna.cpp` is an experimental XDNA1 backend for `llama.cpp`. It runs Q4_0 GEMV operations on the AMD NPU while leaving the rest of the model on the normal llama.cpp CPU path.
 
-## Quick Start
+It is not a new inference runtime and it is not trying to replace llama.cpp. It just plugs into GGML as another backend.
 
-### Pre-built release (Linux x86_64)
+Right now the main focus is getting useful decode performance out of the 16 AIE2 tiles found in Ryzen 7040 and 8040 APUs.
 
-Download the release bundle which includes `llama-cli`, `llama-bench`, `llama-server`, and `libggml-xdna.so`:
+## What works
+
+Currently working:
+
+* XDNA1 / AIE2 execution through XRT
+* all 16 AIE2 tiles
+* Q4_0 dequant + GEMV on the NPU
+* GGML backend integration
+* normal GGUF models
+* bounded weight staging for models much larger than the NPU memory
+* CPU / NPU crossover so tiny matmuls don't get pointlessly offloaded
+* tested from Qwen 0.5B up to Qwen 27B
+* numerical comparisons against the normal CPU path
+
+The backend mainly intercepts supported `GGML_OP_MUL_MAT` operations.
+
+Stuff like attention, normalization, sampling and unsupported operations still runs on the host.
+
+So this is a hybrid backend rn, not full model execution on the NPU.
+
+## Performance
+
+Tested on Ryzen 7 7840U / 8840HS machines with 32 GB RAM on Linux.
+
+```text
+Qwen2.5 0.5B Q4_0
+
+llama.cpp CPU, 8 threads
+106.5 ± 4.9 tok/s
+
+XDNA hybrid
+72.6 ± 1.9 tok/s
+```
+
+The NPU loses here.
+
+That is actually expected. Tiny projections finish so quickly on the CPU that XDNA dispatch and synchronization overhead ends up costing more than the compute itself.
+
+For a larger model:
+
+```text
+Qwen2.5 3B Q4_0
+
+llama.cpp CPU, 8 threads
+9.8 ± 0.4 tok/s
+
+XDNA hybrid
+16.5 ± 1.3 tok/s
+```
+
+Around a 68.8% improvement over the CPU baseline.
+
+And the largest test so far:
+
+```text
+Qwen3.8 27B Q4_0
+
+27.3B parameters
+~12.6 GiB of streamed weights
+1.72 ± 0.05 tok/s
+```
+
+The 27B run is probably the more interesting result.
+
+The model obviously does not fit inside some tiny dedicated NPU memory pool. The weights stay mmap'd normally and get streamed through a fixed staging area when needed.
+
+## The memory problem
+
+The first version created persistent XRT buffer objects for model tensors.
+
+That worked on small models and then completely fell apart on the 27B test.
+
+Around 12.6 GiB of weights ended up pinned as unevictable memory. Linux lost a huge amount of usable page cache, started swapping heavily and decode dropped to roughly:
+
+```text
+0.15 tok/s
+```
+
+So instead of keeping every tensor inside an XRT buffer, the current backend keeps the model file backed as normal memory and uses two staging buffers:
+
+```text
+64 MiB buffer A
+64 MiB buffer B
+
+128 MiB pinned total
+```
+
+Weights are copied through these buffers as layers execute.
+
+Same 12.6 GiB model, but only 128 MiB needs to stay pinned for staging.
+
+That brought the 27B run up to around 1.72 tok/s without nuking system memory.
+
+## How the NPU path works
+
+For supported Q4_0 matmuls the flow is roughly:
+
+```text
+GGUF Q4_0 weights
+        |
+        v
+normal mmap / page cache
+        |
+        v
+128 MiB staging buffers
+        |
+        v
+XDNA DMA
+        |
+        v
+16 AIE2 tiles
+        |
+        v
+uint4 unpack
+BF16 scaling
+vector MAC
+        |
+        v
+host memory
+        |
+        v
+rest of llama.cpp
+```
+
+The AIE kernel unpacks the 4 bit weights, applies the Q4_0 block scale and performs the matrix vector work using the AIE vector units.
+
+The result gets sent back to the host and llama.cpp continues normally.
+
+## CPU vs NPU
+
+One thing that became obvious pretty quickly is that offloading every supported operation is not automatically faster.
+
+Small matmuls are often better left on the CPU.
+
+Large ones are where the NPU starts making sense.
+
+So xdna.cpp uses a crossover instead of blindly throwing every matrix at XDNA.
+
+The goal is tokens/sec, not getting a nice looking "100% NPU" number.
+
+## Correctness
+
+The NPU outputs were also compared against separate pure CPU runs.
+
+```text
+Qwen2.5 0.5B
+
+32 / 32 top 1 tokens matched
+logit cosine: 0.999511
+relative L2: 3.12%
+```
+
+```text
+Qwen2.5 3B
+
+16 / 16 top 1 tokens matched
+logit cosine: 0.997227
+relative L2: 7.08%
+```
+
+```text
+Qwen3.8 27B
+
+16 / 16 top 1 tokens matched
+logit cosine: 0.999906
+relative L2: 1.41%
+```
+
+There are small differences from the CPU path because the AIE implementation goes through BF16 internally, but all evaluated tokens matched the CPU top 1 output.
+
+## Quick start
+
+There is a prebuilt Linux x86_64 release with `llama-cli`, `llama-bench`, `llama-server` and the XDNA backend.
 
 ```bash
 wget https://github.com/random-unknown-username/xdna.cpp/releases/download/v1.0.0/xdna-llama-linux-x86_64.tar.gz
+
 tar -xzf xdna-llama-linux-x86_64.tar.gz
 cd xdna-llama-linux-x86_64
+```
 
-# download a test model (Qwen 0.5B)
+Grab a small Q4_0 model for testing:
+
+```bash
 wget -c https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf
+```
 
-# run chat on NPU
+Run it:
+
+```bash
 ./run-chat.sh qwen2.5-0.5b-instruct-q4_0.gguf
 ```
 
----
+## Building
 
-## How It Works
+You currently need:
 
-Phoenix and Hawk Point APUs (Ryzen 7040 / 8040 series) include an NPU array with 16 AIE2 tiles (4 columns x 4 rows).
+* Ryzen 7040 Phoenix or Ryzen 8040 Hawk Point
+* Linux
+* `amdxdna`
+* `/dev/accel/accel0`
+* AMD XRT 2.18+
+* access to the `render` group
+* CMake
+* a C++ compiler
 
-`xdna.cpp` registers as a dynamic GGML backend (`libggml-xdna.so`) that intercepts `GGML_OP_MUL_MAT` operations on `Q4_0` tensors. When a layer executes:
-1. Weights are streamed via DMA into the 16 AIE2 tiles.
-2. The kernel unpacks 4-bit nibbles to BF16, applies block delta scaling, and executes vector MAC operations.
-3. Output activations return to host memory for attention, normalization, and sampling.
-
-```
-   GGUF Q4_0 Weights (mmap)
-             │
-             ▼ (Bounded 128 MB Staging BOs)
-   ┌────────────────────────────────────────────────┐
-   │ AMD XDNA1 NPU (4 Columns × 4 Rows = 16 Tiles)  │
-   │   - uint4 unpack → BF16 scale → vector MAC     │
-   │   - ~32–38 GB/s sustained streaming throughput │
-   └────────────────────────────────────────────────┘
-             │
-             ▼
-   Host CPU (Norms, Attention, Sampling) → Tokens
-```
-
----
-
-## Benchmarks
-
-Measured on AMD Ryzen 7 7840U / 8840HS (32 GB LPDDR5, Linux 6.x):
-
-| Model | Parameters | Quant | CPU Baseline (llama.cpp, 8T) | XDNA Hybrid Backend (8T) | Notes |
-|---|---|---|---|---|---|
-| Qwen2.5-0.5B | 630 M | Q4_0 | 106.5 ± 4.9 tok/s | 72.6 ± 1.9 tok/s | CPU favored for small 60 KB projections |
-| Qwen2.5-3B | 3.4 B | Q4_0 | 9.8 ± 0.4 tok/s | 16.5 ± 1.3 tok/s | +68.8% speedup over CPU baseline |
-| Qwen3.8-27B | 27.3 B | Q4_0 | — *(not measured)* | 1.72 ± 0.05 tok/s | 12.6 GiB streamed via bounded staging |
-
----
-
-## Bounded Staging Architecture
-
-Large models (like 27B) have hundreds of weight matrices totaling ~12.6 GiB. Statically creating persistent XRT Buffer Objects (`xrt::bo`) for every tensor pins all 12.6 GB into `Unevictable` kernel memory, starving Linux of evictable page cache and triggering heavy disk swap thrashing (dropping decode speed to 0.15 tok/s).
-
-`xdna.cpp` solves this with a **bounded double-buffered staging ring**:
-- Weights remain in normal file-backed page cache (`MAP_SHARED`).
-- The runtime allocates exactly two 64 MB host-only staging BOs (**128 MB total pinned RAM**).
-- Weights stream through the alternating buffers into the NPU DMA channels during layer evaluation.
-- Page faults and swap drop to zero, sustaining **1.72 tok/s** on consumer laptops.
-
----
-
-## Numerical Verification
-
-Verified against pure CPU IEEE 754 reference outputs using binary logit comparisons across separate processes:
-
-| Model | Evaluated Tokens | Top-1 Match | Logit Cosine Similarity | Relative L2 Delta |
-|---|---|---|---|---|
-| Qwen2.5-0.5B | 32 Tokens | 32 / 32 (100%) | 0.999511 | 3.12 % |
-| Qwen2.5-3B | 16 Tokens | 16 / 16 (100%) | 0.997227 | 7.08 % |
-| Qwen3.8-27B | 16 Tokens | 16 / 16 (100%) | 0.999906 | 1.41 % |
-
----
-
-## Building from Source
-
-### 1. Build xdna.cpp
+Clone and build:
 
 ```bash
 git clone https://github.com/random-unknown-username/xdna.cpp.git
@@ -95,12 +223,21 @@ cd xdna.cpp
 
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+```
 
+Check that the NPU is visible:
+
+```bash
 ./build/xdna-cli probe
+```
+
+Run the tests:
+
+```bash
 ctest --test-dir build --output-on-failure
 ```
 
-### 2. Build llama.cpp with XDNA backend
+For llama.cpp, build with the XDNA backend enabled:
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp.git
@@ -108,21 +245,43 @@ cd llama.cpp
 
 cmake -B build -S . -DGGML_XDNA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+```
 
+Then run a Q4_0 model with the XDNA device:
+
+```bash
 ./build/bin/llama-cli -m /path/to/model.gguf --device XDNA0 -cnv -t 8
 ```
 
----
+## Current limitations
 
-## Requirements
+This is still pretty early.
 
-- AMD Ryzen 7040 ("Phoenix") or 8040 ("Hawk Point") APU.
-- Linux kernel with `amdxdna` driver (`/dev/accel/accel0`).
-- AMD XRT 2.18+ (`/opt/xilinx/xrt`).
-- User in `render` group (`sudo usermod -a -G render $USER`).
+The current fast path is mainly Q4_0 decode GEMV. It is not a general purpose accelerator for every GGML operation yet.
 
----
+Phoenix and Hawk Point are the targets rn. Other XDNA generations have not been properly supported or tested.
+
+Prefill is also not the main focus yet.
+
+There is still a lot left to mess with, especially better overlap between DMA and compute, more quant formats, lower dispatch overhead and figuring out how far larger models can be pushed.
+
+## Why I made this
+
+Mostly curiosity.
+
+These NPUs are already sitting inside a ton of Ryzen laptops and there really isn't much in the local LLM space using them directly.
+
+I didn't want to make another completely separate inference runtime just to prove it could run a matrix multiply.
+
+Using a llama.cpp backend means GGUF loading, model support, sampling and everything else can stay where it already works, while the parts that make sense for the NPU can move over gradually.
+
+The first few versions were pretty cursed, especially the one casually pinning 12 GB of RAM, but it works now and there is a lot more stuff worth trying.
+
+If you have a Phoenix or Hawk Point machine and manage to run this on it, results are welcome.
 
 ## License
 
-MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream llama.cpp and AMD acknowledgments.
+MIT.
+
+See `THIRD_PARTY_NOTICES.md` for the upstream llama.cpp and AMD acknowledgements.
+````
