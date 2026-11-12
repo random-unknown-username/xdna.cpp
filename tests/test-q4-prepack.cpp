@@ -1,6 +1,7 @@
 #include "xdna/q4_prepack.h"
 #include "xdna/q4_0_reference.h"
 
+#undef NDEBUG
 #include <cassert>
 #include <cmath>
 #include <iostream>

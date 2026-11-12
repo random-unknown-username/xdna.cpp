@@ -135,6 +135,15 @@ size_t ggml_type_type_size(GgmlType type) {
         case GgmlType::Q5_K: return 2 * sizeof(uint16_t) + 256 / 2 + 256 / 8 + 12;
         case GgmlType::Q6_K: return sizeof(uint16_t) + 256 / 2 + 256 / 4 + 256 / 16;
         case GgmlType::Q8_K: return 256 + sizeof(float);
+        case GgmlType::IQ2_XXS: return 66;
+        case GgmlType::IQ2_XS: return 74;
+        case GgmlType::IQ2_S: return 82;
+        case GgmlType::IQ3_XXS: return 98;
+        case GgmlType::IQ3_S: return 114;
+        case GgmlType::IQ1_S: return 50;
+        case GgmlType::IQ1_M: return 56;
+        case GgmlType::IQ4_NL: return 18;
+        case GgmlType::IQ4_XS: return 136;
         default: return 1;
     }
 }
@@ -332,8 +341,22 @@ int main(int argc, char** argv) {
         t.byte_size = (n_elements / bs) * ts;
 
         // XDNA capability check:
-        // V0 supports Q4_0 2D matrix projections where dimensions are multiples of 32
-        if (t.type == GgmlType::Q4_0 && t.n_dims == 2 && (t.dims[0] % 32 == 0)) {
+        // Hardware streaming GEMV pipeline supports Q4_0, Q4_K, Q5_K, Q3_K, Q6_K, IQ4_XS, IQ3_S 2D projections
+        bool is_xdna = false;
+        if (t.n_dims == 2 && (t.dims[1] % 4 == 0)) {
+            if (t.type == GgmlType::Q4_0 && (t.dims[0] % 32 == 0)) {
+                is_xdna = true;
+            } else if ((t.type == GgmlType::Q4_K ||
+                        t.type == GgmlType::Q5_K ||
+                        t.type == GgmlType::Q3_K ||
+                        t.type == GgmlType::Q6_K ||
+                        t.type == GgmlType::IQ4_XS ||
+                        t.type == GgmlType::IQ3_S) && (t.dims[0] % 256 == 0)) {
+                is_xdna = true;
+            }
+        }
+
+        if (is_xdna) {
             t.xdna_capable = true;
             xdna_capable_bytes += t.byte_size;
             xdna_tensor_count++;
@@ -358,6 +381,7 @@ int main(int argc, char** argv) {
         total_model_bytes += t.byte_size;
         tensors.push_back(t);
     }
+    (void)q4_0_tensor_count;
 
     std::cout << "\nTensor Inventory Summary:\n";
     std::cout << "--------------------------------------------------------------------------------\n";

@@ -96,6 +96,7 @@ bool load_gguf_tensor(const std::string& model_path,
     }
 
     if (!found || target_dims.size() != 2) return false;
+    (void)target_type;
 
     // Align to 32 bytes for binary data start
     uint64_t cur_pos = f.tellg();
@@ -198,9 +199,12 @@ int main(int argc, char** argv) {
                   << (metrics.passed ? "PASS" : "FAIL") << '\n';
     }
 
-    // 2. Real Qwen Tensor Benchmark
-    std::string model_path = (argc > 1) ? argv[1] : "/home/satvik/FORK/Qwen3.8-27B-Q4_0.gguf";
-    std::cout << "\n--- Part 2: Real Qwen3.8-27B Model Tensor Benchmark (Gate 5) ---\n";
+    // 2. Real model tensor benchmark, only when a GGUF is supplied
+    if (argc <= 1) {
+        return 0;
+    }
+    const std::string model_path = argv[1];
+    std::cout << "\n--- Part 2: Model Tensor Benchmark (Gate 5) ---\n";
     std::cout << "Model file: " << model_path << "\n\n";
 
     const std::vector<std::string> qwen_tensors = {

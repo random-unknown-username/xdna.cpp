@@ -1,6 +1,7 @@
 #include "xdna/ggml-xdna.h"
 #include "xdna/q4_0_reference.h"
 
+#undef NDEBUG
 #include <cassert>
 #include <cmath>
 #include <iostream>

@@ -1,7 +1,5 @@
-/build/
-/build-no-xrt/
+/build*/
 compile_commands.json
 .cache/
-DEVLOGS.md
-devlogs/
-
+__pycache__/
+*.pyc
